@@ -123,32 +123,39 @@ def page_dashboard():
 
     colA, colB = st.columns([2,1])
 
-    # Equity curve (gradient area)
-    with colA:
-        st.subheader("Equity Curve (Closed)")
-        if not closed.empty:
-            curve = closed.sort_values("exit_date")[["exit_date","net_pl"]].copy()
-            curve["equity"] = curve["net_pl"].cumsum()
-            chart = (
-                alt.Chart(curve, title=None)
-                .mark_area(
-                    line={"color":"#FF4B4B","strokeWidth":2},
-                    color=alt.Gradient(
-                        gradient="linear",
-                        stops=[alt.GradientStop(color="#FF4B4B", offset=0), alt.GradientStop(color="#FF4B4B00", offset=1)],
-                        x1=1, x2=1, y1=1, y2=0,
-                    )
-                )
-                .encode(
-                    x=alt.X("exit_date:T", title="Date"),
-                    y=alt.Y("equity:Q", title="Cumulative Net P/L ($)"),
-                    tooltip=["exit_date:T","equity:Q"]
-                )
-                .properties(height=280)
+    # Equity curve (layered area + line, no gradient)
+with colA:
+    st.subheader("Equity Curve (Closed)")
+    if not closed.empty:
+        curve = closed.sort_values("exit_date")[["exit_date","net_pl"]].copy()
+        curve["equity"] = curve["net_pl"].fillna(0).cumsum()
+        curve = curve.dropna(subset=["exit_date"])
+
+        area = (
+            alt.Chart(curve)
+            .mark_area(color="#FF4B4B", opacity=0.25)
+            .encode(
+                x=alt.X("exit_date:T", title="Date"),
+                y=alt.Y("equity:Q", title="Cumulative Net P/L ($)")
             )
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("No closed trades yet.")
+            .properties(height=280)
+        )
+
+        line = (
+            alt.Chart(curve)
+            .mark_line(color="#FF4B4B", strokeWidth=2)
+            .encode(
+                x="exit_date:T",
+                y="equity:Q",
+                tooltip=[alt.Tooltip("exit_date:T", title="Date"),
+                         alt.Tooltip("equity:Q", title="Equity")]
+            )
+        )
+
+        st.altair_chart(area + line, use_container_width=True)
+    else:
+        st.info("No closed trades yet.")
+
 
     # Open positions allocation (donut)
     with colB:
