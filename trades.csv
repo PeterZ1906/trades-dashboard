@@ -1,0 +1,3 @@
+id,symbol,company,side,shares,entry_total,entry_date,stop_price,target1_price,target2_price,exit_date,exit_price,fees_total,strategy_tag,notes
+1,AAPL,Apple Inc,long,0.75,135.0,2025-08-01,175.0,190.0,200.0,2025-08-15,192.0,0.0,Breakout,Test trade
+2,TSLA,Tesla,short,0.4,100.0,2025-08-05,280.0,250.0,240.0,2025-08-22,235.0,0.0,Mean Reversion,Test trade 2
