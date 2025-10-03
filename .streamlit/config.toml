@@ -1,0 +1,6 @@
+[theme]
+base="dark"
+primaryColor="#FF4B4B"            # accent (buttons, sliders)
+backgroundColor="#111418"         # app background
+secondaryBackgroundColor="#1B2228" # card background
+textColor="#E8EEF2"               # text
