@@ -1,6 +1,7 @@
 
 import streamlit as st
 import pandas as pd
+import altair as alt
 from datetime import date
 from dateutil import tz
 from pathlib import Path
@@ -80,7 +81,29 @@ def kpis(df):
 
 def page_dashboard():
     st.header("Dashboard")
-    df = compute_derived(load_trades())
+
+    # --- Filters (friendlier) ---
+    df_all = compute_derived(load_trades())
+    with st.expander("Filters", expanded=True):
+        colf1, colf2, colf3, colf4 = st.columns([1,1,1,1])
+        start = colf1.date_input("Start date", value=None)
+        end   = colf2.date_input("End date", value=None)
+        syms  = colf3.multiselect("Symbols", sorted([s for s in df_all["symbol"].dropna().unique()]))
+        tags  = colf4.multiselect("Strategy tags", sorted([t for t in df_all["strategy_tag"].dropna().unique()]))
+
+    mask = pd.Series([True]*len(df_all))
+    if start is not None:
+        mask &= (pd.to_datetime(df_all["entry_date"]).dt.date >= pd.to_datetime(start).date())
+    if end is not None:
+        mask &= (pd.to_datetime(df_all["exit_date"].fillna(df_all["entry_date"])).dt.date <= pd.to_datetime(end).date())
+    if syms:
+        mask &= df_all["symbol"].isin(syms)
+    if tags:
+        mask &= df_all["strategy_tag"].isin(tags)
+
+    df = df_all[mask].copy()
+
+    # --- KPIs (card-like row) ---
     stats = kpis(df)
     c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
     c1.metric("Closed Trades", stats["closed_trades"])
@@ -90,27 +113,143 @@ def page_dashboard():
     c5.metric("Expectancy ($)", f"{stats['expectancy']:.2f}" if stats['expectancy'] is not None else "—")
     c6.metric("Max Drawdown ($)", f"{stats['max_drawdown']:.2f}")
     c7.metric("Net P/L ($)", f"{stats['net_pl_total']:.2f}")
-    st.subheader("Equity Curve (Closed)")
-    d = df[df["status"]=="Closed"].copy()
-    if len(d):
-        curve = d.sort_values("exit_date")[["exit_date","net_pl"]].copy()
-        curve["equity"] = curve["net_pl"].cumsum()
-        st.line_chart(curve.set_index("exit_date")[["equity"]])
+
+    st.markdown("---")
+
+    # --- Charts (colorful & readable via Altair) ---
+    # Prepare frames
+    closed = df[df["status"]=="Closed"].copy()
+    openpos = df[df["status"]=="Open"].copy()
+
+    colA, colB = st.columns([2,1])
+
+    # Equity curve (gradient area)
+    with colA:
+        st.subheader("Equity Curve (Closed)")
+        if not closed.empty:
+            curve = closed.sort_values("exit_date")[["exit_date","net_pl"]].copy()
+            curve["equity"] = curve["net_pl"].cumsum()
+            chart = (
+                alt.Chart(curve, title=None)
+                .mark_area(
+                    line={"color":"#FF4B4B","strokeWidth":2},
+                    color=alt.Gradient(
+                        gradient="linear",
+                        stops=[alt.GradientStop(color="#FF4B4B", offset=0), alt.GradientStop(color="#FF4B4B00", offset=1)],
+                        x1=1, x2=1, y1=1, y2=0,
+                    )
+                )
+                .encode(
+                    x=alt.X("exit_date:T", title="Date"),
+                    y=alt.Y("equity:Q", title="Cumulative Net P/L ($)"),
+                    tooltip=["exit_date:T","equity:Q"]
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("No closed trades yet.")
+
+    # Open positions allocation (donut)
+    with colB:
+        st.subheader("Open Allocation")
+        if not openpos.empty:
+            alloc = openpos.groupby("symbol", dropna=False)["entry_total"].sum().reset_index()
+            alloc["entry_total"] = alloc["entry_total"].fillna(0)
+            base = alt.Chart(alloc).encode(theta=alt.Theta("entry_total:Q"), color=alt.Color("symbol:N"), tooltip=["symbol","entry_total"])
+            donut = base.mark_arc(innerRadius=60)
+            st.altair_chart(donut.properties(height=280), use_container_width=True)
+        else:
+            st.info("No open positions.")
+
+    col1, col2 = st.columns(2)
+
+    # Monthly P/L (bar by YearMonth)
+    with col1:
+        st.subheader("Monthly P/L (Closed)")
+        if not closed.empty:
+            m = closed.copy()
+            m["ym"] = pd.to_datetime(m["exit_date"]).dt.to_period("M").astype(str)
+            m = m.groupby("ym", as_index=False)["net_pl"].sum()
+            bar = (
+                alt.Chart(m)
+                .mark_bar()
+                .encode(x=alt.X("ym:N", title="Month"), y=alt.Y("net_pl:Q", title="Net P/L ($)"), color=alt.condition("datum.net_pl >= 0", alt.value("#2ECC71"), alt.value("#E74C3C")), tooltip=["ym","net_pl"])
+                .properties(height=240)
+            )
+            st.altair_chart(bar, use_container_width=True)
+        else:
+            st.info("Close trades to see monthly results.")
+
+    # P/L by Strategy (top 10)
+    with col2:
+        st.subheader("P/L by Strategy")
+        if not closed.empty:
+            s = closed.groupby("strategy_tag", dropna=False)["net_pl"].sum().reset_index().rename(columns={"strategy_tag":"strategy"})
+            s = s.sort_values("net_pl", ascending=False).head(10)
+            bar = (
+                alt.Chart(s)
+                .mark_bar()
+                .encode(y=alt.Y("strategy:N", sort="-x", title="Strategy"), x=alt.X("net_pl:Q", title="Net P/L ($)"),
+                        color=alt.condition("datum.net_pl >= 0", alt.value("#2ECC71"), alt.value("#E74C3C")),
+                        tooltip=["strategy","net_pl"])
+                .properties(height=240)
+            )
+            st.altair_chart(bar, use_container_width=True)
+        else:
+            st.info("No closed trades yet.")
+
+    col3, col4 = st.columns(2)
+
+    # R Multiple Distribution
+    with col3:
+        st.subheader("R Multiple Distribution (Closed)")
+        r = closed["r_multiple"].dropna().astype(float)
+        if len(r):
+            rdf = pd.DataFrame({"R": r})
+            hist = (
+                alt.Chart(rdf)
+                .transform_bin("bin_R", "R", bin=alt.Bin(maxbins=25))
+                .mark_bar()
+                .encode(x=alt.X("bin_R:Q", title="R multiple"), y="count()", color=alt.value("#8E7CFF"), tooltip=[alt.Tooltip("count()", title="Count")])
+                .properties(height=240)
+            )
+            st.altair_chart(hist, use_container_width=True)
+        else:
+            st.info("Add stops & exits to compute R.")
+
+    # Win / Loss streak (sequence)
+    with col4:
+        st.subheader("Win/Loss Sequence (Closed)")
+        if not closed.empty:
+            seq = closed.sort_values("exit_date")[["exit_date","net_pl"]].copy()
+            seq["result"] = (seq["net_pl"] >= 0).map({True:"Win", False:"Loss"})
+            seq["n"] = range(1, len(seq)+1)
+            dot = (
+                alt.Chart(seq)
+                .mark_circle(size=90)
+                .encode(
+                    x=alt.X("n:O", title="Trade # (by close)"),
+                    y=alt.Y("net_pl:Q", title="Net P/L ($)"),
+                    color=alt.Color("result:N", scale=alt.Scale(domain=["Win","Loss"], range=["#2ECC71","#E74C3C"])),
+                    tooltip=["exit_date:T","net_pl:Q","result:N"]
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(dot, use_container_width=True)
+        else:
+            st.info("No closed trades yet.")
+
+    # Quick insights
+    st.markdown("---")
+    st.subheader("Quick Insights")
+    if not closed.empty:
+        top_sym = closed.groupby("symbol")["net_pl"].sum().sort_values(ascending=False).head(3)
+        worst_sym = closed.groupby("symbol")["net_pl"].sum().sort_values(ascending=True).head(3)
+        st.write(f"**Top symbols:** {', '.join([f'{i} (${v:.0f})' for i,v in top_sym.items()])}" if len(top_sym) else "—")
+        st.write(f"**Tough symbols:** {', '.join([f'{i} (${v:.0f})' for i,v in worst_sym.items()])}" if len(worst_sym) else "—")
     else:
-        st.info("No closed trades yet.")
-    st.subheader("P/L by Strategy (Closed)")
-    if len(d):
-        by = d.groupby("strategy_tag", dropna=False)["net_pl"].sum().reset_index().rename(columns={"strategy_tag":"strategy"})
-        st.bar_chart(by.set_index("strategy")[["net_pl"]])
-    else:
-        st.info("No data yet.")
-    st.subheader("R Multiple Distribution (Closed)")
-    r = d["r_multiple"].dropna().astype(float)
-    if len(r):
-        bins = pd.cut(r, bins=20); hist = r.groupby(bins).size()
-        st.bar_chart(hist)
-    else:
-        st.info("Add stops & exits to compute R.")
+        st.write("Add and close a few trades to see insights.")
 
 def page_add_trade():
     st.header("Add Trade")
