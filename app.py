@@ -1,11 +1,11 @@
 # app.py
 # ============================================================
-# Trades Dashboard App (Enhanced)
+# Trades Dashboard App (Excel-style, using trades.csv only)
 # - Sidebar nav: Dashboard  |  Add / Manage Trades
 # - CSV persistence at repo root: trades.csv
 # - Integer-step spinners (step=1) inside the form
 # - Delete selected or delete-all with confirmation
-# - Beautiful, useful analytics on the Dashboard
+# - Beautiful analytics on the Dashboard (realized metrics)
 # ============================================================
 import os
 import uuid
@@ -17,6 +17,34 @@ import altair as alt
 
 st.set_page_config(page_title="Trades Dashboard", layout="wide")
 
+# -----------------------------
+# Theme (Altair) & colors
+# -----------------------------
+ACCENT_GREEN = "#37d67a"
+ACCENT_RED = "#f47373"
+ACCENT_BLUE = "#7aa5ff"
+CARD_BG = "#1a1a1a"
+BORDER = "#333333"
+
+def _altair_dark_theme():
+    return {
+        "config": {
+            "view": {"stroke": "transparent"},
+            "axis": {
+                "domainColor": "#666",
+                "gridColor": "#222",
+                "labelColor": "#ddd",
+                "titleColor": "#eee",
+                "grid": True,
+            },
+            "legend": {"labelColor": "#ddd", "titleColor": "#eee"},
+            "title": {"color": "#fff"},
+            "background": "transparent",
+        }
+    }
+
+alt.themes.register("custom_dark", _altair_dark_theme)
+alt.themes.enable("custom_dark")
 
 # -----------------------------
 # Storage / data helpers
@@ -41,7 +69,6 @@ TRADE_COLUMNS = [
     "created_at",
 ]
 
-
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure required columns exist; add empty defaults if missing."""
     for c in TRADE_COLUMNS:
@@ -51,7 +78,6 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 df[c] = ""
     return df[TRADE_COLUMNS]
-
 
 def load_trades() -> pd.DataFrame:
     if not os.path.exists(TRADES_CSV):
@@ -75,15 +101,13 @@ def load_trades() -> pd.DataFrame:
 
     return _ensure_columns(df)
 
-
 def save_trades(df: pd.DataFrame) -> None:
     df = _ensure_columns(df.copy())
     df.to_csv(TRADES_CSV, index=False)
 
-
 # ---------- Derived metrics helpers ----------
 def add_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Add derived columns for analytics."""
+    """Add derived columns for analytics (realized only where applicable)."""
     if df.empty:
         return df
 
@@ -122,15 +146,17 @@ def add_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     # Win/Loss
     df["win"] = (df["pnl"] > 0).where(df["realized"], False)
 
+    # Open exposure (unrealized cost basis only; we do not have live prices)
+    df["open"] = ~df["realized"]
+    df["open_cost"] = df["entry_total"].where(df["open"], 0.0)
+
     return df
 
-
-def kpi(value, label, help_text=None, fmt=None):
+def kpi(value, label, delta=None, fmt=None, help_text=None):
     """Small helper for clean KPI blocks."""
     if fmt:
         value = fmt(value)
-    st.metric(label, value, help=help_text)
-
+    st.metric(label, value, delta, help=help_text)
 
 # -----------------------------
 # UI: Sidebar navigation
@@ -142,12 +168,11 @@ page = st.sidebar.radio(
     index=0,
 )
 
-
-# -----------------------------
+# ============================================================
 # Page: Dashboard
-# -----------------------------
+# ============================================================
 if page == "Dashboard":
-    st.title("Dashboard")
+    st.title("Portfolio Summary")
 
     raw = load_trades()
     df = add_trade_metrics(raw)
@@ -184,16 +209,25 @@ if page == "Dashboard":
 
         # Derived subsets
         realized = df_f[df_f["realized"]].copy()
+        open_pos = df_f[df_f["open"]].copy()
 
-        # --- KPIs row
+        # Portfolio-style summary (based only on trades.csv data)
+        total_invested = float(df_f["entry_total"].sum())
+        realized_pnl = float(realized["pnl"].sum()) if not realized.empty else 0.0
+        open_cost = float(open_pos["open_cost"].sum()) if not open_pos.empty else 0.0
+
+        # KPIs row 1 (mimics your top ribbon)
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            kpi(len(df_f), "Total Trades")
+            # Portfolio Value proxy (invested + realized P&L); no live prices available
+            portfolio_value_proxy = total_invested + realized_pnl
+            kpi(portfolio_value_proxy, "Portfolio Value*", fmt=lambda x: f"${x:,.2f}",
+                help_text="Proxy: Invested cash + Realized P&L (no live prices).")
         with c2:
-            kpi(df_f["shares"].sum(), "Total Shares", fmt=lambda x: f"{x:,.4f}")
+            kpi(open_cost, "Open Cost Basis", fmt=lambda x: f"${x:,.2f}",
+                help_text="Total cost committed to currently open positions.")
         with c3:
-            total_fees = realized["fees_total"].sum() if not realized.empty else 0.0
-            kpi(total_fees, "Total Fees ($)", fmt=lambda x: f"{x:,.2f}")
+            kpi(realized_pnl, "Realized P&L ($)", fmt=lambda x: f"${x:,.2f}")
         with c4:
             win_rate = (realized["win"].mean() * 100.0) if not realized.empty else 0.0
             kpi(win_rate, "Win Rate", fmt=lambda x: f"{x:.1f}%")
@@ -201,35 +235,62 @@ if page == "Dashboard":
             avg_ret = realized["ret_pct"].mean() if not realized.empty else 0.0
             kpi(avg_ret, "Avg Return / Trade", fmt=lambda x: f"{x:.2f}%")
 
-        # --- Charts
-        st.markdown("### Performance Overview")
+        st.caption("*) Without live prices, this is a proxy. We can add live quotes later for true market value & unrealized P&L.")
+
+        # --- PERFORMANCE OVER TIME
+        st.subheader("Performance")
+        colA, colB = st.columns([2, 1])
 
         # Equity curve (cumulative P&L)
-        if realized.empty:
-            st.info("No realized trades yet to plot the Equity Curve.")
-        else:
-            ec = realized.sort_values("exit_dt")[["exit_dt", "pnl"]].dropna()
-            ec = ec.groupby("exit_dt", as_index=False).agg(pnl=("pnl", "sum"))
-            ec["cum_pnl"] = ec["pnl"].cumsum()
+        with colA:
+            if realized.empty:
+                st.info("No realized trades yet to plot the Equity Curve.")
+            else:
+                ec = realized.sort_values("exit_dt")[["exit_dt", "pnl"]].dropna()
+                ec = ec.groupby("exit_dt", as_index=False).agg(pnl=("pnl", "sum"))
+                ec["cum_pnl"] = ec["pnl"].cumsum()
 
-            line = (
-                alt.Chart(ec, height=260)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("exit_dt:T", title="Exit Date"),
-                    y=alt.Y("cum_pnl:Q", title="Cumulative P&L ($)"),
-                    tooltip=["exit_dt:T", alt.Tooltip("cum_pnl:Q", format=",.2f")],
+                line = (
+                    alt.Chart(ec, height=320)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("exit_dt:T", title="Exit Date"),
+                        y=alt.Y("cum_pnl:Q", title="Cumulative P&L ($)"),
+                        tooltip=["exit_dt:T", alt.Tooltip("cum_pnl:Q", format=",.2f")],
+                    )
+                    .properties(title="Equity Curve (Realized P&L)")
                 )
-                .properties(title="Equity Curve (Realized P&L)")
-            )
-            st.altair_chart(line, use_container_width=True)
+                st.altair_chart(line, use_container_width=True)
 
-        st.markdown("### Breakdown")
+        # Monthly P&L bars
+        with colB:
+            if realized.empty:
+                st.info("No realized trades for monthly P&L.")
+            else:
+                rm = realized.dropna(subset=["exit_dt"]).copy()
+                rm["month"] = rm["exit_dt"].dt.to_period("M").dt.to_timestamp()
+                month_pnl = rm.groupby("month", as_index=False).agg(total_pnl=("pnl", "sum"))
+                month_pnl["color"] = month_pnl["total_pnl"].apply(lambda v: ACCENT_GREEN if v >= 0 else ACCENT_RED)
 
-        col_a, col_b = st.columns(2)
+                bar = (
+                    alt.Chart(month_pnl, height=320)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("month:T", title="Month"),
+                        y=alt.Y("total_pnl:Q", title="P&L ($)"),
+                        color=alt.Color("color:N", scale=None, legend=None),
+                        tooltip=["month:T", alt.Tooltip("total_pnl:Q", format=",.2f")],
+                    )
+                    .properties(title="P&L by Month")
+                )
+                st.altair_chart(bar, use_container_width=True)
+
+        # --- BREAKDOWN
+        st.subheader("Breakdown")
+        col1, col2, col3 = st.columns(3)
 
         # P&L by Symbol (bar)
-        with col_a:
+        with col1:
             if realized.empty:
                 st.info("No realized trades to show P&L by symbol.")
             else:
@@ -238,12 +299,14 @@ if page == "Dashboard":
                     .agg(total_pnl=("pnl", "sum"))
                     .sort_values("total_pnl", ascending=False)
                 )
+                pnl_sym["color"] = pnl_sym["total_pnl"].apply(lambda v: ACCENT_GREEN if v >= 0 else ACCENT_RED)
                 bar = (
                     alt.Chart(pnl_sym, height=300)
                     .mark_bar()
                     .encode(
                         x=alt.X("total_pnl:Q", title="Total P&L ($)"),
                         y=alt.Y("symbol:N", sort="-x", title="Symbol"),
+                        color=alt.Color("color:N", scale=None, legend=None),
                         tooltip=[alt.Tooltip("total_pnl:Q", format=",.2f"), "symbol:N"],
                     )
                     .properties(title="Total Realized P&L by Symbol")
@@ -251,7 +314,7 @@ if page == "Dashboard":
                 st.altair_chart(bar, use_container_width=True)
 
         # Win rate by symbol (bar)
-        with col_b:
+        with col2:
             if realized.empty:
                 st.info("No realized trades to show Win Rate.")
             else:
@@ -277,12 +340,34 @@ if page == "Dashboard":
                 )
                 st.altair_chart(bar_wr, use_container_width=True)
 
-        st.markdown("### Distributions")
+        # Diversification (by symbol cost basis of open positions)
+        with col3:
+            if open_pos.empty:
+                st.info("No open positions to show diversification.")
+            else:
+                dv = (
+                    open_pos.groupby("symbol", as_index=False)
+                    .agg(open_cost=("open_cost", "sum"))
+                    .sort_values("open_cost", ascending=False)
+                )
+                pie = (
+                    alt.Chart(dv, height=300)
+                    .mark_arc(outerRadius=130)
+                    .encode(
+                        theta=alt.Theta("open_cost:Q", stack=True, title=""),
+                        color=alt.Color("symbol:N", title="Symbol"),
+                        tooltip=[alt.Tooltip("open_cost:Q", format=",.2f"), "symbol:N"],
+                    )
+                    .properties(title="Open Cost Diversification")
+                )
+                st.altair_chart(pie, use_container_width=True)
 
-        col_c, col_d = st.columns(2)
+        # --- DISTRIBUTIONS
+        st.subheader("Distributions")
+        colC, colD = st.columns(2)
 
         # Return distribution (hist)
-        with col_c:
+        with colC:
             if realized.empty:
                 st.info("No realized trades to show return distribution.")
             else:
@@ -299,7 +384,7 @@ if page == "Dashboard":
                 st.altair_chart(ret_hist, use_container_width=True)
 
         # Holding period distribution (hist)
-        with col_d:
+        with colD:
             if realized.empty:
                 st.info("No realized trades to show holding periods.")
             else:
@@ -315,7 +400,8 @@ if page == "Dashboard":
                 )
                 st.altair_chart(hold_hist, use_container_width=True)
 
-        st.markdown("### Summary by Symbol")
+        # --- SUMMARY TABLE
+        st.subheader("Summary by Symbol")
         if realized.empty:
             st.info("No realized trades yet for summary.")
         else:
@@ -327,43 +413,60 @@ if page == "Dashboard":
                     shares=("shares", "sum"),
                     total_pnl=("pnl", "sum"),
                     avg_ret_pct=("ret_pct", "mean"),
+                    med_ret_pct=("ret_pct", "median"),
                     avg_hold_days=("hold_days", "mean"),
                     fees_total=("fees_total", "sum"),
                 )
                 .sort_values(by=["total_pnl"], ascending=False)
             )
-            sym_summary["win_rate"] = (sym_summary["wins"] / sym_summary["trades"] * 100.0).round(1)
-            sym_summary = sym_summary[
-                ["symbol", "trades", "wins", "win_rate", "shares", "total_pnl", "avg_ret_pct", "avg_hold_days", "fees_total"]
-            ]
+            sym_summary["win_rate(%)"] = (sym_summary["wins"] / sym_summary["trades"] * 100.0).round(1)
             sym_summary.rename(
                 columns={
-                    "win_rate": "win_rate(%)",
                     "total_pnl": "total_pnl($)",
                     "avg_ret_pct": "avg_return(%)",
+                    "med_ret_pct": "median_return(%)",
                     "avg_hold_days": "avg_hold(days)",
                     "fees_total": "fees_total($)",
                 },
                 inplace=True,
             )
-            st.dataframe(sym_summary, use_container_width=True)
+            show_cols = ["symbol", "trades", "wins", "win_rate(%)", "shares", "total_pnl($)", "avg_return(%)", "median_return(%)", "avg_hold(days)", "fees_total($)"]
+            st.dataframe(sym_summary[show_cols], use_container_width=True)
 
-        st.markdown("### All Trades (filtered)")
+        # --- FILTERED TRADES TABLE (styled)
+        st.subheader("All Trades (filtered)")
         show_cols = [
             "id", "entry_date", "symbol", "side", "shares", "entry_total", "stop_price",
             "target1", "target2", "exit_date", "exit_price", "fees_total", "company",
-            "strategy", "notes", "created_at"
+            "strategy", "notes", "pnl", "ret_pct", "hold_days", "created_at"
         ]
         show_cols = [c for c in show_cols if c in df_f.columns]
-        st.dataframe(
-            df_f[show_cols].sort_values(by=["entry_date", "symbol"], ascending=[False, True]),
-            use_container_width=True,
-            height=380,
-        )
+        table = df_f[show_cols].sort_values(by=["entry_date", "symbol"], ascending=[False, True]).copy()
 
-# -----------------------------
+        # Format columns
+        money_cols = ["entry_total", "exit_price", "fees_total", "pnl"]
+        pct_cols = ["ret_pct"]
+        int_cols = ["hold_days", "shares"]
+
+        for c in money_cols:
+            if c in table.columns:
+                table[c] = table[c].map(lambda x: f"${x:,.2f}")
+        if "exit_price" in table.columns:
+            # already formatted above
+            pass
+        for c in pct_cols:
+            if c in table.columns:
+                table[c] = table[c].map(lambda x: f"{float(x):.2f}%")
+        if "shares" in table.columns:
+            table["shares"] = table["shares"].map(lambda x: f"{float(x):,.4f}")
+        if "hold_days" in table.columns:
+            table["hold_days"] = table["hold_days"].map(lambda x: "" if pd.isna(x) else int(x))
+
+        st.dataframe(table, use_container_width=True, height=420)
+
+# ============================================================
 # Page: Add / Manage Trades
-# -----------------------------
+# ============================================================
 else:
     st.title("Add Trade")
 
