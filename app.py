@@ -1,7 +1,7 @@
 # app.py
 # ------------------------------------------------------------
 # Trades Dashboard: Add & Manage Trades
-# - Integer step +/- controls
+# - Integer step spinners (step=1) in form
 # - CSV persistence (trades.csv at repo root)
 # - Delete selected / delete all with confirmation
 # ------------------------------------------------------------
@@ -42,14 +42,11 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure required columns exist; add empty defaults if missing."""
     for c in TRADE_COLUMNS:
         if c not in df.columns:
-            # numeric-ish defaults vs string defaults
             if c in {"shares", "entry_total", "stop_price", "target1", "target2", "exit_price", "fees_total"}:
                 df[c] = 0.0
             else:
                 df[c] = ""
-    # enforce column order
-    df = df[TRADE_COLUMNS]
-    return df
+    return df[TRADE_COLUMNS]
 
 
 def load_trades() -> pd.DataFrame:
@@ -66,60 +63,12 @@ def load_trades() -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = _ensure_columns(df)
-    return df
+    return _ensure_columns(df)
 
 
 def save_trades(df: pd.DataFrame) -> None:
     df = _ensure_columns(df.copy())
     df.to_csv(TRADES_CSV, index=False)
-
-
-# ==============================
-# Integer-step helper
-# ==============================
-def int_step_number_input(
-    label: str,
-    key: str,
-    value: float = 0.0,
-    step: int = 1,
-    min_value: float | None = None,
-    max_value: float | None = None,
-    format: str | None = None,
-    help: str | None = None,
-):
-    """
-    Number input with explicit – / + buttons that move in *integer* steps.
-    Users can still TYPE fractional values; the buttons always change by whole integers.
-    """
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-    c_input, c_minus, c_plus = st.columns([10, 1, 1], vertical_alignment="bottom")
-    with c_input:
-        st.session_state[key] = st.number_input(
-            label,
-            key=f"{key}_num",
-            value=float(st.session_state[key]),
-            min_value=min_value,
-            max_value=max_value,
-            help=help,
-            format=(format if format else None),
-        )
-    with c_minus:
-        if st.button("–", key=f"{key}_minus"):
-            st.session_state[key] = float(st.session_state[key]) - int(step)
-            if min_value is not None:
-                st.session_state[key] = max(st.session_state[key], float(min_value))
-            st.rerun()
-    with c_plus:
-        if st.button("+", key=f"{key}_plus"):
-            st.session_state[key] = float(st.session_state[key]) + int(step)
-            if max_value is not None:
-                st.session_state[key] = min(st.session_state[key], float(max_value))
-            st.rerun()
-
-    return float(st.session_state[key])
 
 
 # ==============================
@@ -133,48 +82,50 @@ with st.form("add_trade_form", enter_to_submit=False):
     # ----- Column 1 -----
     with c1:
         symbol = st.text_input("Symbol *", value="AMZN").upper().strip()
-        entry_total = int_step_number_input(
-            "Entry Total ($) *", key="entry_total", value=0.00, step=1, min_value=0.0, format="%.2f"
+        # step=1 => integer increments via spinner arrows; user can still TYPE decimals
+        entry_total = st.number_input(
+            "Entry Total ($) *", min_value=0.0, value=0.00, step=1.0, format="%.2f", help="Spinner moves by whole dollars"
         )
-        stop_price = int_step_number_input(
-            "Stop Price (optional)", key="stop_price", value=0.0, step=1, min_value=0.0, format="%.4f"
+        stop_price = st.number_input(
+            "Stop Price (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f",
+            help="Spinner moves by 1; type a decimal if you want"
         )
         use_exit_date = st.checkbox("Set Exit Date", value=True)
         exit_date_dt = st.date_input(
-            "Exit Date (optional)",
-            value=date.today(),
-            format="YYYY/MM/DD",
-            disabled=not use_exit_date,
+            "Exit Date (optional)", value=date.today(), format="YYYY/MM/DD", disabled=not use_exit_date
         )
 
     # ----- Column 2 -----
     with c2:
         side = st.selectbox("Side *", options=["long", "short"], index=0)
         entry_date_dt = st.date_input("Entry Date *", value=date.today(), format="YYYY/MM/DD")
-        target1 = int_step_number_input(
-            "Target 1 (optional)", key="target1", value=0.0, step=1, min_value=0.0, format="%.4f"
+        target1 = st.number_input(
+            "Target 1 (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f",
+            help="Spinner moves by 1; type a decimal if needed"
         )
-        exit_price = int_step_number_input(
-            "Exit Price (optional)", key="exit_price", value=0.0, step=1, min_value=0.0, format="%.4f"
+        exit_price = st.number_input(
+            "Exit Price (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f"
         )
 
     # ----- Column 3 -----
     with c3:
-        shares = int_step_number_input(
-            "Shares (fractional ok) *", key="shares", value=1.0, step=1, min_value=0.0, format="%.6f"
+        shares = st.number_input(
+            "Shares (fractional ok) *", min_value=0.0, value=1.0, step=1.0, format="%.6f",
+            help="Spinner moves by 1; type fractional shares if needed"
         )
         company = st.text_input("Company", value="")
-        target2 = int_step_number_input(
-            "Target 2 (optional)", key="target2", value=0.0, step=1, min_value=0.0, format="%.4f"
+        target2 = st.number_input(
+            "Target 2 (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f"
         )
-        fees_total = int_step_number_input(
-            "Fees Total ($)", key="fees_total", value=0.0, step=1, min_value=0.0, format="%.2f"
+        fees_total = st.number_input(
+            "Fees Total ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
         )
 
     strategy = st.text_input("Strategy / Tag (optional)", value="", help="e.g., 'breakout', 'earnings scalp', 'DCA'")
     notes = st.text_area("Notes", height=140)
 
-    if st.form_submit_button("Save Trade"):
+    submitted = st.form_submit_button("Save Trade")
+    if submitted:
         if not symbol:
             st.error("Symbol is required.")
         else:
@@ -210,7 +161,7 @@ df_all = load_trades()
 if df_all.empty:
     st.info("No trades saved yet.")
 else:
-    # Pretty dataframe
+    # Display table
     df_show = df_all[
         [
             "id", "symbol", "side", "shares", "entry_date", "company", "entry_total", "stop_price",
