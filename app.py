@@ -1,12 +1,13 @@
 # app.py
 # ============================================================
-# Trades Dashboard App (with Edit / Close Trades)
-# - Sidebar nav: Dashboard  |  Add / Manage Trades
-# - CSV persistence at repo root: trades.csv
-# - Integer-step spinners in forms (step=1)
-# - Delete selected / delete-all with confirmation
-# - Beautiful analytics on the Dashboard (realized metrics)
-# - Edit / Close / Reopen any saved trade
+# Trades Dashboard App — with simple numeric Trade IDs (tid)
+# - Sidebar: Dashboard | Add / Manage Trades
+# - CSV persistence: trades.csv
+# - Integer-step spinners in forms
+# - Delete selected / delete-all
+# - Edit / Close / Reopen trade
+# - Pretty analytics on Dashboard
+# - NEW: simple numeric ID (#tid) used in selectors
 # ============================================================
 import os
 import uuid
@@ -49,8 +50,12 @@ alt.themes.enable("custom_dark")
 # Storage / data helpers
 # -----------------------------
 TRADES_CSV = "trades.csv"
+# simple numeric trade id column name
+TID_COL = "tid"
+
 TRADE_COLUMNS = [
-    "id",
+    "id",          # uuid
+    TID_COL,       # simple integer id
     "symbol",
     "side",
     "shares",
@@ -68,37 +73,70 @@ TRADE_COLUMNS = [
     "created_at",
 ]
 
+NUMERIC_COLS = {"shares", "entry_total", "stop_price", "target1", "target2", "exit_price", "fees_total"}
+
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure required columns exist; add empty defaults if missing."""
     for c in TRADE_COLUMNS:
         if c not in df.columns:
-            if c in {"shares", "entry_total", "stop_price", "target1", "target2", "exit_price", "fees_total"}:
+            if c in NUMERIC_COLS:
                 df[c] = 0.0
+            elif c == TID_COL:
+                df[c] = pd.Series(dtype="Int64")
             else:
                 df[c] = ""
+    # enforce order
     return df[TRADE_COLUMNS]
+
+def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+    for col in NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # TID as nullable int
+    if TID_COL in df.columns:
+        df[TID_COL] = pd.to_numeric(df[TID_COL], errors="coerce").astype("Int64")
+    # clean dates
+    for dcol in ["entry_date", "exit_date"]:
+        if dcol in df.columns:
+            df[dcol] = df[dcol].fillna("")
+    return df
+
+def _assign_missing_tids_inplace(df: pd.DataFrame) -> None:
+    """Give any rows without a tid a new sequential one."""
+    if df.empty:
+        return
+    # current max tid (ignore NA)
+    max_tid = int(df[TID_COL].dropna().max()) if df[TID_COL].notna().any() else 0
+    # rows that need a tid
+    needs = df[TID_COL].isna()
+    count = int(needs.sum())
+    if count > 0:
+        new_ids = range(max_tid + 1, max_tid + 1 + count)
+        df.loc[needs, TID_COL] = list(new_ids)
 
 def load_trades() -> pd.DataFrame:
     if not os.path.exists(TRADES_CSV):
         return pd.DataFrame(columns=TRADE_COLUMNS)
 
     df = pd.read_csv(TRADES_CSV, dtype=str)
-
+    # add/migrate uuid
     if "id" not in df.columns:
         df["id"] = [str(uuid.uuid4()) for _ in range(len(df))]
-
-    for col in ["shares", "entry_total", "stop_price", "target1", "target2", "exit_price", "fees_total"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    for dcol in ["entry_date", "exit_date"]:
-        if dcol in df.columns:
-            df[dcol] = df[dcol].fillna("")
-
-    return _ensure_columns(df)
+    df = _ensure_columns(df)
+    df = _coerce_types(df)
+    # assign tids where missing
+    _assign_missing_tids_inplace(df)
+    return df
 
 def save_trades(df: pd.DataFrame) -> None:
     df = _ensure_columns(df.copy())
+    df = _coerce_types(df)
     df.to_csv(TRADES_CSV, index=False)
+
+def next_tid(df: pd.DataFrame) -> int:
+    if df.empty or df[TID_COL].isna().all():
+        return 1
+    return int(df[TID_COL].dropna().max()) + 1
 
 # ---------- Derived metrics helpers ----------
 def add_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -126,7 +164,6 @@ def add_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     df["hold_days"] = (df["exit_dt"] - df["entry_dt"]).dt.days.where(df["realized"], pd.NA)
-
     df["win"] = (df["pnl"] > 0).where(df["realized"], False)
 
     df["open"] = ~df["realized"]
@@ -168,7 +205,6 @@ if page == "Dashboard":
                 date_range = st.date_input("Entry Date range", value=(dmin, dmax), format="YYYY/MM/DD")
             else:
                 date_range = None
-
             symbols = sorted([s for s in df["symbol"].dropna().unique() if s != ""])
             sel_symbols = st.multiselect("Symbols", options=symbols, default=symbols)
 
@@ -193,8 +229,7 @@ if page == "Dashboard":
             kpi(portfolio_value_proxy, "Portfolio Value*", fmt=lambda x: f"${x:,.2f}",
                 help_text="Proxy: Invested cash + Realized P&L (no live prices).")
         with c2:
-            kpi(open_cost, "Open Cost Basis", fmt=lambda x: f"${x:,.2f}",
-                help_text="Total cost committed to currently open positions.")
+            kpi(open_cost, "Open Cost Basis", fmt=lambda x: f"${x:,.2f}")
         with c3:
             kpi(realized_pnl, "Realized P&L ($)", fmt=lambda x: f"${x:,.2f}")
         with c4:
@@ -204,7 +239,7 @@ if page == "Dashboard":
             avg_ret = realized["ret_pct"].mean() if not realized.empty else 0.0
             kpi(avg_ret, "Avg Return / Trade", fmt=lambda x: f"{x:.2f}%")
 
-        st.caption("*) Without live prices, this is a proxy. We can add live quotes later for true market value & unrealized P&L.")
+        st.caption("*) Without live prices, this is a proxy. Add quotes later for true MV & unrealized P&L.")
 
         st.subheader("Performance")
         colA, colB = st.columns([2, 1])
@@ -283,11 +318,7 @@ if page == "Dashboard":
                 .encode(
                     x=alt.X("win_rate_pct:Q", title="Win Rate (%)"),
                     y=alt.Y("symbol:N", sort="-x", title="Symbol"),
-                    tooltip=[
-                        alt.Tooltip("win_rate_pct:Q", format=".1f"),
-                        alt.Tooltip("trades:Q", title="Trades"),
-                        "symbol:N",
-                    ],
+                    tooltip=[alt.Tooltip("win_rate_pct:Q", format=".1f"), alt.Tooltip("trades:Q", title="Trades"), "symbol:N"],
                 )
                 .properties(title="Win Rate by Symbol")
             )
@@ -315,13 +346,13 @@ if page == "Dashboard":
 
         st.subheader("All Trades (filtered)")
         show_cols = [
-            "id", "entry_date", "symbol", "side", "shares", "entry_total", "stop_price",
+            TID_COL, "id", "entry_date", "symbol", "side", "shares", "entry_total", "stop_price",
             "target1", "target2", "exit_date", "exit_price", "fees_total", "company",
             "strategy", "notes", "pnl", "ret_pct", "hold_days", "created_at"
         ]
         show_cols = [c for c in show_cols if c in df_f.columns]
         st.dataframe(
-            df_f[show_cols].sort_values(by=["entry_date", "symbol"], ascending=[False, True]),
+            df_f[show_cols].sort_values(by=[TID_COL], ascending=False),
             use_container_width=True,
             height=420,
         )
@@ -361,8 +392,10 @@ else:
             if not symbol:
                 st.error("Symbol is required.")
             else:
+                df = load_trades()
                 record = {
                     "id": str(uuid.uuid4()),
+                    TID_COL: next_tid(df),
                     "symbol": symbol,
                     "side": side,
                     "shares": float(shares),
@@ -379,10 +412,9 @@ else:
                     "notes": notes,
                     "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 }
-                df = load_trades()
                 df = pd.concat([df, pd.DataFrame([record])], ignore_index=True)
                 save_trades(df)
-                st.success("Trade saved.")
+                st.success(f"Trade saved as #{record[TID_COL]}.")
                 st.json(record)
 
     st.divider()
@@ -394,27 +426,28 @@ else:
     else:
         df_show = df_all[
             [
-                "id", "symbol", "side", "shares", "entry_date", "company", "entry_total", "stop_price",
+                TID_COL, "id", "symbol", "side", "shares", "entry_date", "company", "entry_total", "stop_price",
                 "target1", "target2", "exit_date", "exit_price", "fees_total", "strategy", "notes", "created_at"
             ]
-        ].sort_values(by=["entry_date", "symbol"], ascending=[False, True])
+        ].sort_values(by=[TID_COL], ascending=False)
 
         st.dataframe(df_show, use_container_width=True, height=300)
 
         # ---------- Delete Selected (multi) ----------
         st.subheader("Delete Selected")
+
         def make_label(row):
-            ed = row.get("entry_date", "")
-            sym = row.get("symbol", "")
-            side_ = row.get("side", "")
-            sh = row.get("shares", "")
-            return f"{ed} • {sym} • {side_} • {sh}"
+            return f"#{int(row[TID_COL])} · {row['symbol']} · {row['side']} · {row['shares']} · {row['entry_date']}"
 
         labels = df_all.apply(make_label, axis=1).tolist()
-        id_to_label = dict(zip(df_all["id"], labels))
-        label_to_id = {v: k for k, v in id_to_label.items()}
+        tid_to_label = dict(zip(df_all[TID_COL].astype(int), labels))
+        label_to_tid = {v: k for k, v in tid_to_label.items()}
 
-        selected_labels = st.multiselect("Choose one or more trades to delete:", options=labels, placeholder="Select trade(s)…")
+        selected_labels = st.multiselect(
+            "Choose one or more trades to delete:",
+            options=labels,
+            placeholder="Select trade(s)…",
+        )
 
         c_del1, c_del2 = st.columns([1, 1])
         with c_del1:
@@ -422,10 +455,10 @@ else:
                 if not selected_labels:
                     st.warning("No trades selected.")
                 else:
-                    selected_ids = {label_to_id[lbl] for lbl in selected_labels}
-                    df_new = df_all[~df_all["id"].isin(selected_ids)].copy()
+                    tids = {label_to_tid[lbl] for lbl in selected_labels}
+                    df_new = df_all[~df_all[TID_COL].isin(list(tids))].copy()
                     save_trades(df_new)
-                    st.success(f"Deleted {len(selected_ids)} trade(s).")
+                    st.success(f"Deleted {len(tids)} trade(s).")
                     st.rerun()
 
         with c_del2:
@@ -443,10 +476,11 @@ else:
         # ---------- Edit / Close a Single Trade ----------
         st.subheader("Edit / Close a Trade")
 
-        # Select one trade to edit
-        edit_label = st.selectbox("Choose a trade to edit:", options=labels, index=0)
-        edit_id = label_to_id[edit_label]
-        row = df_all[df_all["id"] == edit_id].iloc[0]
+        # chooser sorted by newest first
+        labels_sorted = [tid_to_label[i] for i in sorted(tid_to_label.keys(), reverse=True)]
+        edit_label = st.selectbox("Choose a trade to edit:", options=labels_sorted, index=0)
+        edit_tid = label_to_tid[edit_label]
+        row = df_all[df_all[TID_COL] == edit_tid].iloc[0]
 
         with st.form("edit_trade_form", enter_to_submit=False):
             ec1, ec2, ec3 = st.columns(3)
@@ -455,13 +489,22 @@ else:
                 e_symbol = st.text_input("Symbol", value=str(row["symbol"])).upper().strip()
                 e_entry_total = st.number_input("Entry Total ($)", min_value=0.0, value=float(row["entry_total"]), step=1.0, format="%.2f")
                 e_stop_price = st.number_input("Stop Price", min_value=0.0, value=float(row["stop_price"]), step=1.0, format="%.4f")
-                e_entry_date = st.date_input("Entry Date", value=pd.to_datetime(row["entry_date"], errors="coerce").date() if row["entry_date"] else date.today(), format="YYYY/MM/DD")
+                e_entry_date = st.date_input(
+                    "Entry Date",
+                    value=pd.to_datetime(row["entry_date"], errors="coerce").date() if row["entry_date"] else date.today(),
+                    format="YYYY/MM/DD"
+                )
 
             with ec2:
                 e_side = st.selectbox("Side", options=["long", "short"], index=0 if str(row["side"]).lower()=="long" else 1)
                 e_target1 = st.number_input("Target 1", min_value=0.0, value=float(row["target1"]), step=1.0, format="%.4f")
                 e_exit_price = st.number_input("Exit Price", min_value=0.0, value=float(row["exit_price"]), step=1.0, format="%.4f")
-                e_exit_date = st.date_input("Exit Date", value=pd.to_datetime(row["exit_date"], errors="coerce").date() if row["exit_date"] else date.today(), format="YYYY/MM/DD", disabled=(float(row["exit_price"])==0.0 and str(row["exit_date"]).strip()==""))
+                e_exit_date = st.date_input(
+                    "Exit Date",
+                    value=pd.to_datetime(row["exit_date"], errors="coerce").date() if row["exit_date"] else date.today(),
+                    format="YYYY/MM/DD",
+                    disabled=(float(row["exit_price"])==0.0 and str(row["exit_date"]).strip()=="")
+                )
 
             with ec3:
                 e_shares = st.number_input("Shares", min_value=0.0, value=float(row["shares"]), step=1.0, format="%.6f")
@@ -476,8 +519,9 @@ else:
 
             # Save changes
             if c_save.form_submit_button("Save Changes"):
-                df_all.loc[df_all["id"] == edit_id, :] = [
-                    edit_id,
+                df_all.loc[df_all[TID_COL] == edit_tid, :] = [
+                    row["id"],
+                    edit_tid,
                     e_symbol,
                     e_side,
                     float(e_shares),
@@ -495,36 +539,35 @@ else:
                     row["created_at"],
                 ]
                 save_trades(df_all)
-                st.success("Trade updated.")
+                st.success(f"Trade #{edit_tid} updated.")
                 st.rerun()
 
             # Quick close (sets today's exit date unless changed above)
             with c_close:
                 if st.form_submit_button("Close Trade"):
-                    # Ensure we have an exit price to close
                     if float(e_exit_price) <= 0:
                         st.error("Set an Exit Price to close this trade.")
                     else:
-                        df_all.loc[df_all["id"] == edit_id, "exit_price"] = float(e_exit_price)
-                        df_all.loc[df_all["id"] == edit_id, "exit_date"] = date.today().strftime("%Y/%m/%d")
-                        df_all.loc[df_all["id"] == edit_id, "fees_total"] = float(e_fees_total)
+                        df_all.loc[df_all[TID_COL] == edit_tid, "exit_price"] = float(e_exit_price)
+                        df_all.loc[df_all[TID_COL] == edit_tid, "exit_date"] = date.today().strftime("%Y/%m/%d")
+                        df_all.loc[df_all[TID_COL] == edit_tid, "fees_total"] = float(e_fees_total)
                         save_trades(df_all)
-                        st.success("Trade closed.")
+                        st.success(f"Trade #{edit_tid} closed.")
                         st.rerun()
 
             # Reopen (clear exit price/date)
             with c_reopen:
                 if st.form_submit_button("Reopen Trade"):
-                    df_all.loc[df_all["id"] == edit_id, "exit_price"] = 0.0
-                    df_all.loc[df_all["id"] == edit_id, "exit_date"] = ""
+                    df_all.loc[df_all[TID_COL] == edit_tid, "exit_price"] = 0.0
+                    df_all.loc[df_all[TID_COL] == edit_tid, "exit_date"] = ""
                     save_trades(df_all)
-                    st.success("Trade reopened.")
+                    st.success(f"Trade #{edit_tid} reopened.")
                     st.rerun()
 
             # Delete this one
             with c_delete_one:
                 if st.form_submit_button("Delete This Trade"):
-                    df_new = df_all[df_all["id"] != edit_id].copy()
+                    df_new = df_all[df_all[TID_COL] != edit_tid].copy()
                     save_trades(df_new)
-                    st.success("Trade deleted.")
+                    st.success(f"Trade #{edit_tid} deleted.")
                     st.rerun()
