@@ -1,11 +1,12 @@
 # app.py
 # ============================================================
-# Trades Dashboard App (Excel-style, using trades.csv only)
+# Trades Dashboard App (with Edit / Close Trades)
 # - Sidebar nav: Dashboard  |  Add / Manage Trades
 # - CSV persistence at repo root: trades.csv
-# - Integer-step spinners (step=1) inside the form
-# - Delete selected or delete-all with confirmation
+# - Integer-step spinners in forms (step=1)
+# - Delete selected / delete-all with confirmation
 # - Beautiful analytics on the Dashboard (realized metrics)
+# - Edit / Close / Reopen any saved trade
 # ============================================================
 import os
 import uuid
@@ -23,8 +24,6 @@ st.set_page_config(page_title="Trades Dashboard", layout="wide")
 ACCENT_GREEN = "#37d67a"
 ACCENT_RED = "#f47373"
 ACCENT_BLUE = "#7aa5ff"
-CARD_BG = "#1a1a1a"
-BORDER = "#333333"
 
 def _altair_dark_theme():
     return {
@@ -70,7 +69,6 @@ TRADE_COLUMNS = [
 ]
 
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure required columns exist; add empty defaults if missing."""
     for c in TRADE_COLUMNS:
         if c not in df.columns:
             if c in {"shares", "entry_total", "stop_price", "target1", "target2", "exit_price", "fees_total"}:
@@ -85,16 +83,13 @@ def load_trades() -> pd.DataFrame:
 
     df = pd.read_csv(TRADES_CSV, dtype=str)
 
-    # Migration: ensure there's an ID
     if "id" not in df.columns:
         df["id"] = [str(uuid.uuid4()) for _ in range(len(df))]
 
-    # Types
     for col in ["shares", "entry_total", "stop_price", "target1", "target2", "exit_price", "fees_total"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Normalize dates
     for dcol in ["entry_date", "exit_date"]:
         if dcol in df.columns:
             df[dcol] = df[dcol].fillna("")
@@ -107,53 +102,38 @@ def save_trades(df: pd.DataFrame) -> None:
 
 # ---------- Derived metrics helpers ----------
 def add_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Add derived columns for analytics (realized only where applicable)."""
     if df.empty:
         return df
 
     df = df.copy()
-
-    # Parse dates
     df["entry_dt"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["exit_dt"] = pd.to_datetime(df["exit_date"], errors="coerce")
-
-    # Entry price per share (guard div-by-zero)
     df["entry_price"] = (df["entry_total"] / df["shares"]).where(df["shares"] > 0, pd.NA)
 
-    # Realized trades only (have exit price >0 and exit date)
     df["realized"] = (~df["exit_dt"].isna()) & (df["exit_price"] > 0)
 
-    # Per-trade P&L ($) and Return (%)
     long_mask = (df["side"].str.lower() == "long") & df["realized"]
     short_mask = (df["side"].str.lower() == "short") & df["realized"]
 
     df["pnl"] = 0.0
     df.loc[long_mask, "pnl"] = (df.loc[long_mask, "exit_price"] - df.loc[long_mask, "entry_price"]) * df.loc[long_mask, "shares"]
     df.loc[short_mask, "pnl"] = (df.loc[short_mask, "entry_price"] - df.loc[short_mask, "exit_price"]) * df.loc[short_mask, "shares"]
-
-    # fees_total is total per trade (subtract once)
     df.loc[df["realized"], "pnl"] = df.loc[df["realized"], "pnl"] - df.loc[df["realized"], "fees_total"]
 
-    # % return based on cost basis (entry_total); keep safe
     df["ret_pct"] = 0.0
     df.loc[df["realized"] & (df["entry_total"] > 0), "ret_pct"] = (
         df.loc[df["realized"], "pnl"] / df.loc[df["realized"], "entry_total"] * 100.0
     )
 
-    # Holding period (days) for realized trades
     df["hold_days"] = (df["exit_dt"] - df["entry_dt"]).dt.days.where(df["realized"], pd.NA)
 
-    # Win/Loss
     df["win"] = (df["pnl"] > 0).where(df["realized"], False)
 
-    # Open exposure (unrealized cost basis only; we do not have live prices)
     df["open"] = ~df["realized"]
     df["open_cost"] = df["entry_total"].where(df["open"], 0.0)
-
     return df
 
 def kpi(value, label, delta=None, fmt=None, help_text=None):
-    """Small helper for clean KPI blocks."""
     if fmt:
         value = fmt(value)
     st.metric(label, value, delta, help=help_text)
@@ -180,18 +160,12 @@ if page == "Dashboard":
     if df.empty:
         st.info("No trades yet. Add some on the **Add / Manage Trades** page.")
     else:
-        # --- Filters
         with st.expander("Filters", expanded=False):
-            # date range filter (based on entry_date)
             valid_entries = df[~df["entry_dt"].isna()]
             if not valid_entries.empty:
                 dmin = valid_entries["entry_dt"].min().date()
                 dmax = valid_entries["entry_dt"].max().date()
-                date_range = st.date_input(
-                    "Entry Date range",
-                    value=(dmin, dmax),
-                    format="YYYY/MM/DD",
-                )
+                date_range = st.date_input("Entry Date range", value=(dmin, dmax), format="YYYY/MM/DD")
             else:
                 date_range = None
 
@@ -199,7 +173,6 @@ if page == "Dashboard":
             sel_symbols = st.multiselect("Symbols", options=symbols, default=symbols)
 
         df_f = df.copy()
-        # Apply filters
         if date_range and isinstance(date_range, tuple) and len(date_range) == 2:
             start, end = date_range
             mask = df_f["entry_dt"].between(pd.to_datetime(start), pd.to_datetime(end))
@@ -207,19 +180,15 @@ if page == "Dashboard":
         if sel_symbols:
             df_f = df_f[df_f["symbol"].isin(sel_symbols)]
 
-        # Derived subsets
         realized = df_f[df_f["realized"]].copy()
         open_pos = df_f[df_f["open"]].copy()
 
-        # Portfolio-style summary (based only on trades.csv data)
         total_invested = float(df_f["entry_total"].sum())
         realized_pnl = float(realized["pnl"].sum()) if not realized.empty else 0.0
         open_cost = float(open_pos["open_cost"].sum()) if not open_pos.empty else 0.0
 
-        # KPIs row 1 (mimics your top ribbon)
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            # Portfolio Value proxy (invested + realized P&L); no live prices available
             portfolio_value_proxy = total_invested + realized_pnl
             kpi(portfolio_value_proxy, "Portfolio Value*", fmt=lambda x: f"${x:,.2f}",
                 help_text="Proxy: Invested cash + Realized P&L (no live prices).")
@@ -237,203 +206,113 @@ if page == "Dashboard":
 
         st.caption("*) Without live prices, this is a proxy. We can add live quotes later for true market value & unrealized P&L.")
 
-        # --- PERFORMANCE OVER TIME
         st.subheader("Performance")
         colA, colB = st.columns([2, 1])
-
-        # Equity curve (cumulative P&L)
-        with colA:
-            if realized.empty:
+        if realized.empty:
+            with colA:
                 st.info("No realized trades yet to plot the Equity Curve.")
-            else:
-                ec = realized.sort_values("exit_dt")[["exit_dt", "pnl"]].dropna()
-                ec = ec.groupby("exit_dt", as_index=False).agg(pnl=("pnl", "sum"))
-                ec["cum_pnl"] = ec["pnl"].cumsum()
-
-                line = (
-                    alt.Chart(ec, height=320)
-                    .mark_line(point=True)
-                    .encode(
-                        x=alt.X("exit_dt:T", title="Exit Date"),
-                        y=alt.Y("cum_pnl:Q", title="Cumulative P&L ($)"),
-                        tooltip=["exit_dt:T", alt.Tooltip("cum_pnl:Q", format=",.2f")],
-                    )
-                    .properties(title="Equity Curve (Realized P&L)")
-                )
-                st.altair_chart(line, use_container_width=True)
-
-        # Monthly P&L bars
-        with colB:
-            if realized.empty:
+            with colB:
                 st.info("No realized trades for monthly P&L.")
-            else:
-                rm = realized.dropna(subset=["exit_dt"]).copy()
-                rm["month"] = rm["exit_dt"].dt.to_period("M").dt.to_timestamp()
-                month_pnl = rm.groupby("month", as_index=False).agg(total_pnl=("pnl", "sum"))
-                month_pnl["color"] = month_pnl["total_pnl"].apply(lambda v: ACCENT_GREEN if v >= 0 else ACCENT_RED)
-
-                bar = (
-                    alt.Chart(month_pnl, height=320)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("month:T", title="Month"),
-                        y=alt.Y("total_pnl:Q", title="P&L ($)"),
-                        color=alt.Color("color:N", scale=None, legend=None),
-                        tooltip=["month:T", alt.Tooltip("total_pnl:Q", format=",.2f")],
-                    )
-                    .properties(title="P&L by Month")
+        else:
+            ec = realized.sort_values("exit_dt")[["exit_dt", "pnl"]].dropna()
+            ec = ec.groupby("exit_dt", as_index=False).agg(pnl=("pnl", "sum"))
+            ec["cum_pnl"] = ec["pnl"].cumsum()
+            line = (
+                alt.Chart(ec, height=320)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("exit_dt:T", title="Exit Date"),
+                    y=alt.Y("cum_pnl:Q", title="Cumulative P&L ($)"),
+                    tooltip=["exit_dt:T", alt.Tooltip("cum_pnl:Q", format=",.2f")],
                 )
-                st.altair_chart(bar, use_container_width=True)
+                .properties(title="Equity Curve (Realized P&L)")
+            )
+            colA.altair_chart(line, use_container_width=True)
 
-        # --- BREAKDOWN
+            rm = realized.dropna(subset=["exit_dt"]).copy()
+            rm["month"] = rm["exit_dt"].dt.to_period("M").dt.to_timestamp()
+            month_pnl = rm.groupby("month", as_index=False).agg(total_pnl=("pnl", "sum"))
+            month_pnl["color"] = month_pnl["total_pnl"].apply(lambda v: ACCENT_GREEN if v >= 0 else ACCENT_RED)
+            bar = (
+                alt.Chart(month_pnl, height=320)
+                .mark_bar()
+                .encode(
+                    x=alt.X("month:T", title="Month"),
+                    y=alt.Y("total_pnl:Q", title="P&L ($)"),
+                    color=alt.Color("color:N", scale=None, legend=None),
+                    tooltip=["month:T", alt.Tooltip("total_pnl:Q", format=",.2f")],
+                )
+                .properties(title="P&L by Month")
+            )
+            colB.altair_chart(bar, use_container_width=True)
+
         st.subheader("Breakdown")
         col1, col2, col3 = st.columns(3)
-
-        # P&L by Symbol (bar)
-        with col1:
-            if realized.empty:
-                st.info("No realized trades to show P&L by symbol.")
-            else:
-                pnl_sym = (
-                    realized.groupby("symbol", as_index=False)
-                    .agg(total_pnl=("pnl", "sum"))
-                    .sort_values("total_pnl", ascending=False)
-                )
-                pnl_sym["color"] = pnl_sym["total_pnl"].apply(lambda v: ACCENT_GREEN if v >= 0 else ACCENT_RED)
-                bar = (
-                    alt.Chart(pnl_sym, height=300)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("total_pnl:Q", title="Total P&L ($)"),
-                        y=alt.Y("symbol:N", sort="-x", title="Symbol"),
-                        color=alt.Color("color:N", scale=None, legend=None),
-                        tooltip=[alt.Tooltip("total_pnl:Q", format=",.2f"), "symbol:N"],
-                    )
-                    .properties(title="Total Realized P&L by Symbol")
-                )
-                st.altair_chart(bar, use_container_width=True)
-
-        # Win rate by symbol (bar)
-        with col2:
-            if realized.empty:
-                st.info("No realized trades to show Win Rate.")
-            else:
-                wr = (
-                    realized.groupby("symbol", as_index=False)
-                    .agg(win_rate=("win", "mean"), trades=("id", "count"))
-                    .sort_values("win_rate", ascending=False)
-                )
-                wr["win_rate_pct"] = wr["win_rate"] * 100.0
-                bar_wr = (
-                    alt.Chart(wr, height=300)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("win_rate_pct:Q", title="Win Rate (%)"),
-                        y=alt.Y("symbol:N", sort="-x", title="Symbol"),
-                        tooltip=[
-                            alt.Tooltip("win_rate_pct:Q", format=".1f"),
-                            alt.Tooltip("trades:Q", title="Trades"),
-                            "symbol:N",
-                        ],
-                    )
-                    .properties(title="Win Rate by Symbol")
-                )
-                st.altair_chart(bar_wr, use_container_width=True)
-
-        # Diversification (by symbol cost basis of open positions)
-        with col3:
-            if open_pos.empty:
-                st.info("No open positions to show diversification.")
-            else:
-                dv = (
-                    open_pos.groupby("symbol", as_index=False)
-                    .agg(open_cost=("open_cost", "sum"))
-                    .sort_values("open_cost", ascending=False)
-                )
-                pie = (
-                    alt.Chart(dv, height=300)
-                    .mark_arc(outerRadius=130)
-                    .encode(
-                        theta=alt.Theta("open_cost:Q", stack=True, title=""),
-                        color=alt.Color("symbol:N", title="Symbol"),
-                        tooltip=[alt.Tooltip("open_cost:Q", format=",.2f"), "symbol:N"],
-                    )
-                    .properties(title="Open Cost Diversification")
-                )
-                st.altair_chart(pie, use_container_width=True)
-
-        # --- DISTRIBUTIONS
-        st.subheader("Distributions")
-        colC, colD = st.columns(2)
-
-        # Return distribution (hist)
-        with colC:
-            if realized.empty:
-                st.info("No realized trades to show return distribution.")
-            else:
-                ret_hist = (
-                    alt.Chart(realized.dropna(subset=["ret_pct"]), height=300)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("ret_pct:Q", bin=alt.Bin(maxbins=30), title="Trade Return (%)"),
-                        y=alt.Y("count()", title="Trades"),
-                        tooltip=[alt.Tooltip("count()", title="Trades")],
-                    )
-                    .properties(title="Distribution of Trade Returns")
-                )
-                st.altair_chart(ret_hist, use_container_width=True)
-
-        # Holding period distribution (hist)
-        with colD:
-            if realized.empty:
-                st.info("No realized trades to show holding periods.")
-            else:
-                hold_hist = (
-                    alt.Chart(realized.dropna(subset=["hold_days"]), height=300)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("hold_days:Q", bin=alt.Bin(maxbins=30), title="Holding Period (days)"),
-                        y=alt.Y("count()", title="Trades"),
-                        tooltip=[alt.Tooltip("count()", title="Trades")],
-                    )
-                    .properties(title="Distribution of Holding Periods")
-                )
-                st.altair_chart(hold_hist, use_container_width=True)
-
-        # --- SUMMARY TABLE
-        st.subheader("Summary by Symbol")
         if realized.empty:
-            st.info("No realized trades yet for summary.")
+            col1.info("No realized trades to show P&L by symbol.")
+            col2.info("No realized trades to show Win Rate.")
         else:
-            sym_summary = (
+            pnl_sym = (
                 realized.groupby("symbol", as_index=False)
-                .agg(
-                    trades=("id", "count"),
-                    wins=("win", "sum"),
-                    shares=("shares", "sum"),
-                    total_pnl=("pnl", "sum"),
-                    avg_ret_pct=("ret_pct", "mean"),
-                    med_ret_pct=("ret_pct", "median"),
-                    avg_hold_days=("hold_days", "mean"),
-                    fees_total=("fees_total", "sum"),
+                .agg(total_pnl=("pnl", "sum"))
+                .sort_values("total_pnl", ascending=False)
+            )
+            pnl_sym["color"] = pnl_sym["total_pnl"].apply(lambda v: ACCENT_GREEN if v >= 0 else ACCENT_RED)
+            bar1 = (
+                alt.Chart(pnl_sym, height=300)
+                .mark_bar()
+                .encode(
+                    x=alt.X("total_pnl:Q", title="Total P&L ($)"),
+                    y=alt.Y("symbol:N", sort="-x", title="Symbol"),
+                    color=alt.Color("color:N", scale=None, legend=None),
+                    tooltip=[alt.Tooltip("total_pnl:Q", format=",.2f"), "symbol:N"],
                 )
-                .sort_values(by=["total_pnl"], ascending=False)
+                .properties(title="Total Realized P&L by Symbol")
             )
-            sym_summary["win_rate(%)"] = (sym_summary["wins"] / sym_summary["trades"] * 100.0).round(1)
-            sym_summary.rename(
-                columns={
-                    "total_pnl": "total_pnl($)",
-                    "avg_ret_pct": "avg_return(%)",
-                    "med_ret_pct": "median_return(%)",
-                    "avg_hold_days": "avg_hold(days)",
-                    "fees_total": "fees_total($)",
-                },
-                inplace=True,
-            )
-            show_cols = ["symbol", "trades", "wins", "win_rate(%)", "shares", "total_pnl($)", "avg_return(%)", "median_return(%)", "avg_hold(days)", "fees_total($)"]
-            st.dataframe(sym_summary[show_cols], use_container_width=True)
+            col1.altair_chart(bar1, use_container_width=True)
 
-        # --- FILTERED TRADES TABLE (styled)
+            wr = (
+                realized.groupby("symbol", as_index=False)
+                .agg(win_rate=("win", "mean"), trades=("id", "count"))
+                .sort_values("win_rate", ascending=False)
+            )
+            wr["win_rate_pct"] = wr["win_rate"] * 100.0
+            bar2 = (
+                alt.Chart(wr, height=300)
+                .mark_bar()
+                .encode(
+                    x=alt.X("win_rate_pct:Q", title="Win Rate (%)"),
+                    y=alt.Y("symbol:N", sort="-x", title="Symbol"),
+                    tooltip=[
+                        alt.Tooltip("win_rate_pct:Q", format=".1f"),
+                        alt.Tooltip("trades:Q", title="Trades"),
+                        "symbol:N",
+                    ],
+                )
+                .properties(title="Win Rate by Symbol")
+            )
+            col2.altair_chart(bar2, use_container_width=True)
+
+        if df_f[df_f["open"]].empty:
+            col3.info("No open positions to show diversification.")
+        else:
+            dv = (
+                df_f[df_f["open"]].groupby("symbol", as_index=False)
+                .agg(open_cost=("open_cost", "sum"))
+                .sort_values("open_cost", ascending=False)
+            )
+            pie = (
+                alt.Chart(dv, height=300)
+                .mark_arc(outerRadius=130)
+                .encode(
+                    theta=alt.Theta("open_cost:Q", stack=True, title=""),
+                    color=alt.Color("symbol:N", title="Symbol"),
+                    tooltip=[alt.Tooltip("open_cost:Q", format=",.2f"), "symbol:N"],
+                )
+                .properties(title="Open Cost Diversification")
+            )
+            col3.altair_chart(pie, use_container_width=True)
+
         st.subheader("All Trades (filtered)")
         show_cols = [
             "id", "entry_date", "symbol", "side", "shares", "entry_total", "stop_price",
@@ -441,31 +320,14 @@ if page == "Dashboard":
             "strategy", "notes", "pnl", "ret_pct", "hold_days", "created_at"
         ]
         show_cols = [c for c in show_cols if c in df_f.columns]
-        table = df_f[show_cols].sort_values(by=["entry_date", "symbol"], ascending=[False, True]).copy()
-
-        # Format columns
-        money_cols = ["entry_total", "exit_price", "fees_total", "pnl"]
-        pct_cols = ["ret_pct"]
-        int_cols = ["hold_days", "shares"]
-
-        for c in money_cols:
-            if c in table.columns:
-                table[c] = table[c].map(lambda x: f"${x:,.2f}")
-        if "exit_price" in table.columns:
-            # already formatted above
-            pass
-        for c in pct_cols:
-            if c in table.columns:
-                table[c] = table[c].map(lambda x: f"{float(x):.2f}%")
-        if "shares" in table.columns:
-            table["shares"] = table["shares"].map(lambda x: f"{float(x):,.4f}")
-        if "hold_days" in table.columns:
-            table["hold_days"] = table["hold_days"].map(lambda x: "" if pd.isna(x) else int(x))
-
-        st.dataframe(table, use_container_width=True, height=420)
+        st.dataframe(
+            df_f[show_cols].sort_values(by=["entry_date", "symbol"], ascending=[False, True]),
+            use_container_width=True,
+            height=420,
+        )
 
 # ============================================================
-# Page: Add / Manage Trades
+# Page: Add / Manage Trades (+ Edit/Close)
 # ============================================================
 else:
     st.title("Add Trade")
@@ -473,49 +335,27 @@ else:
     with st.form("add_trade_form", enter_to_submit=False):
         c1, c2, c3 = st.columns(3)
 
-        # ----- Column 1 -----
         with c1:
             symbol = st.text_input("Symbol *", value="AMZN").upper().strip()
-            entry_total = st.number_input(
-                "Entry Total ($) *", min_value=0.0, value=0.00, step=1.0, format="%.2f",
-                help="Spinner moves by $1; type decimals if needed"
-            )
-            stop_price = st.number_input(
-                "Stop Price (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f",
-                help="Spinner moves by 1; type decimals if needed"
-            )
-            use_exit_date = st.checkbox("Set Exit Date", value=True)
-            exit_date_dt = st.date_input(
-                "Exit Date (optional)", value=date.today(), format="YYYY/MM/DD", disabled=not use_exit_date
-            )
+            entry_total = st.number_input("Entry Total ($) *", min_value=0.0, value=0.00, step=1.0, format="%.2f")
+            stop_price = st.number_input("Stop Price (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f")
+            use_exit_date = st.checkbox("Set Exit Date", value=False)
+            exit_date_dt = st.date_input("Exit Date (optional)", value=date.today(), format="YYYY/MM/DD", disabled=not use_exit_date)
 
-        # ----- Column 2 -----
         with c2:
             side = st.selectbox("Side *", options=["long", "short"], index=0)
             entry_date_dt = st.date_input("Entry Date *", value=date.today(), format="YYYY/MM/DD")
-            target1 = st.number_input(
-                "Target 1 (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f"
-            )
-            exit_price = st.number_input(
-                "Exit Price (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f"
-            )
+            target1 = st.number_input("Target 1 (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f")
+            exit_price = st.number_input("Exit Price (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f")
 
-        # ----- Column 3 -----
         with c3:
-            shares = st.number_input(
-                "Shares (fractional ok) *", min_value=0.0, value=1.0, step=1.0, format="%.6f",
-                help="Spinner moves by 1; type fractional shares if needed"
-            )
+            shares = st.number_input("Shares (fractional ok) *", min_value=0.0, value=1.0, step=1.0, format="%.6f")
             company = st.text_input("Company", value="")
-            target2 = st.number_input(
-                "Target 2 (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f"
-            )
-            fees_total = st.number_input(
-                "Fees Total ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f"
-            )
+            target2 = st.number_input("Target 2 (optional)", min_value=0.0, value=0.0, step=1.0, format="%.4f")
+            fees_total = st.number_input("Fees Total ($)", min_value=0.0, value=0.0, step=1.0, format="%.2f")
 
-        strategy = st.text_input("Strategy / Tag (optional)", value="", help="e.g., 'breakout', 'earnings scalp', 'DCA'")
-        notes = st.text_area("Notes", height=140)
+        strategy = st.text_input("Strategy / Tag (optional)", value="")
+        notes = st.text_area("Notes", height=120)
 
         if st.form_submit_button("Save Trade"):
             if not symbol:
@@ -559,9 +399,10 @@ else:
             ]
         ].sort_values(by=["entry_date", "symbol"], ascending=[False, True])
 
-        st.dataframe(df_show, use_container_width=True, height=340)
+        st.dataframe(df_show, use_container_width=True, height=300)
 
-        # Build human labels for delete picker
+        # ---------- Delete Selected (multi) ----------
+        st.subheader("Delete Selected")
         def make_label(row):
             ed = row.get("entry_date", "")
             sym = row.get("symbol", "")
@@ -573,12 +414,7 @@ else:
         id_to_label = dict(zip(df_all["id"], labels))
         label_to_id = {v: k for k, v in id_to_label.items()}
 
-        st.subheader("Delete Selected")
-        selected_labels = st.multiselect(
-            "Choose one or more trades to delete:",
-            options=labels,
-            placeholder="Select trade(s)…",
-        )
+        selected_labels = st.multiselect("Choose one or more trades to delete:", options=labels, placeholder="Select trade(s)…")
 
         c_del1, c_del2 = st.columns([1, 1])
         with c_del1:
@@ -594,7 +430,7 @@ else:
 
         with c_del2:
             with st.popover("Danger Zone: Delete ALL Trades"):
-                st.write("Type **DELETE** (all caps) and press the button to purge every trade.")
+                st.write("Type **DELETE** (all caps) to purge every trade.")
                 confirm_text = st.text_input("Confirmation")
                 if st.button("Delete ALL Trades", type="primary"):
                     if confirm_text.strip() == "DELETE":
@@ -603,3 +439,92 @@ else:
                         st.rerun()
                     else:
                         st.error("Confirmation text did not match 'DELETE'. No action taken.")
+
+        # ---------- Edit / Close a Single Trade ----------
+        st.subheader("Edit / Close a Trade")
+
+        # Select one trade to edit
+        edit_label = st.selectbox("Choose a trade to edit:", options=labels, index=0)
+        edit_id = label_to_id[edit_label]
+        row = df_all[df_all["id"] == edit_id].iloc[0]
+
+        with st.form("edit_trade_form", enter_to_submit=False):
+            ec1, ec2, ec3 = st.columns(3)
+
+            with ec1:
+                e_symbol = st.text_input("Symbol", value=str(row["symbol"])).upper().strip()
+                e_entry_total = st.number_input("Entry Total ($)", min_value=0.0, value=float(row["entry_total"]), step=1.0, format="%.2f")
+                e_stop_price = st.number_input("Stop Price", min_value=0.0, value=float(row["stop_price"]), step=1.0, format="%.4f")
+                e_entry_date = st.date_input("Entry Date", value=pd.to_datetime(row["entry_date"], errors="coerce").date() if row["entry_date"] else date.today(), format="YYYY/MM/DD")
+
+            with ec2:
+                e_side = st.selectbox("Side", options=["long", "short"], index=0 if str(row["side"]).lower()=="long" else 1)
+                e_target1 = st.number_input("Target 1", min_value=0.0, value=float(row["target1"]), step=1.0, format="%.4f")
+                e_exit_price = st.number_input("Exit Price", min_value=0.0, value=float(row["exit_price"]), step=1.0, format="%.4f")
+                e_exit_date = st.date_input("Exit Date", value=pd.to_datetime(row["exit_date"], errors="coerce").date() if row["exit_date"] else date.today(), format="YYYY/MM/DD", disabled=(float(row["exit_price"])==0.0 and str(row["exit_date"]).strip()==""))
+
+            with ec3:
+                e_shares = st.number_input("Shares", min_value=0.0, value=float(row["shares"]), step=1.0, format="%.6f")
+                e_company = st.text_input("Company", value=str(row["company"]))
+                e_target2 = st.number_input("Target 2", min_value=0.0, value=float(row["target2"]), step=1.0, format="%.4f")
+                e_fees_total = st.number_input("Fees Total ($)", min_value=0.0, value=float(row["fees_total"]), step=1.0, format="%.2f")
+
+            e_strategy = st.text_input("Strategy / Tag", value=str(row["strategy"]))
+            e_notes = st.text_area("Notes", value=str(row["notes"]), height=100)
+
+            c_save, c_close, c_reopen, c_delete_one = st.columns([1,1,1,1])
+
+            # Save changes
+            if c_save.form_submit_button("Save Changes"):
+                df_all.loc[df_all["id"] == edit_id, :] = [
+                    edit_id,
+                    e_symbol,
+                    e_side,
+                    float(e_shares),
+                    e_entry_date.strftime("%Y/%m/%d"),
+                    e_company,
+                    float(e_entry_total),
+                    float(e_stop_price),
+                    float(e_target1),
+                    float(e_target2),
+                    e_exit_date.strftime("%Y/%m/%d") if (str(row["exit_date"]).strip() or float(e_exit_price) > 0) else "",
+                    float(e_exit_price),
+                    float(e_fees_total),
+                    e_strategy,
+                    e_notes,
+                    row["created_at"],
+                ]
+                save_trades(df_all)
+                st.success("Trade updated.")
+                st.rerun()
+
+            # Quick close (sets today's exit date unless changed above)
+            with c_close:
+                if st.form_submit_button("Close Trade"):
+                    # Ensure we have an exit price to close
+                    if float(e_exit_price) <= 0:
+                        st.error("Set an Exit Price to close this trade.")
+                    else:
+                        df_all.loc[df_all["id"] == edit_id, "exit_price"] = float(e_exit_price)
+                        df_all.loc[df_all["id"] == edit_id, "exit_date"] = date.today().strftime("%Y/%m/%d")
+                        df_all.loc[df_all["id"] == edit_id, "fees_total"] = float(e_fees_total)
+                        save_trades(df_all)
+                        st.success("Trade closed.")
+                        st.rerun()
+
+            # Reopen (clear exit price/date)
+            with c_reopen:
+                if st.form_submit_button("Reopen Trade"):
+                    df_all.loc[df_all["id"] == edit_id, "exit_price"] = 0.0
+                    df_all.loc[df_all["id"] == edit_id, "exit_date"] = ""
+                    save_trades(df_all)
+                    st.success("Trade reopened.")
+                    st.rerun()
+
+            # Delete this one
+            with c_delete_one:
+                if st.form_submit_button("Delete This Trade"):
+                    df_new = df_all[df_all["id"] != edit_id].copy()
+                    save_trades(df_new)
+                    st.success("Trade deleted.")
+                    st.rerun()
