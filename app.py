@@ -1,6 +1,7 @@
 # app.py
 # ============================================================
 # Trades Dashboard — Themes + Reporting Summary + Editor
+# With Excel-style STOCKS table (bottom) like your screenshot
 # ============================================================
 import os
 import uuid
@@ -28,8 +29,8 @@ THEMES = {
     "Forest": {
         "bg_grad": "linear-gradient(135deg,#0c1207 0%,#0e1a0c 50%,#08140a 100%)",
         "card_grad": "linear-gradient(135deg,rgba(255,255,255,.05),rgba(255,255,255,.02))",
-        "acc1": "#86efac",  # light green
-        "acc2": "#7dd3fc",  # sky
+        "acc1": "#86efac",
+        "acc2": "#7dd3fc",
         "good": "#22c55e",
         "bad":  "#ef4444",
         "muted": "#9ca3af",
@@ -78,13 +79,12 @@ theme_name = st.sidebar.selectbox("Color Theme", list(THEMES.keys()), index=0)
 PRIVACY = st.sidebar.toggle("Privacy Mode (mask numbers)", value=False)
 st.sidebar.markdown("---")
 
-# Pick theme
 THEME = THEMES[theme_name]
-ACCENT = THEME["acc1"]
+ACCENT  = THEME["acc1"]
 ACCENT2 = THEME["acc2"]
-GOOD = THEME["good"]
-BAD = THEME["bad"]
-MUTED = THEME["muted"]
+GOOD    = THEME["good"]
+BAD     = THEME["bad"]
+MUTED   = THEME["muted"]
 
 # Altair theme
 def _alt_theme():
@@ -106,18 +106,16 @@ def _alt_theme():
 alt.themes.register("vibrant_dark", _alt_theme)
 alt.themes.enable("vibrant_dark")
 
-# Global CSS (uses selected theme)
+# Global CSS
 st.markdown(
     f"""
 <style>
-/* Background / sidebar */
 [data-testid="stAppViewContainer"] > .main {{ background: {THEME["bg_grad"]}; }}
 [data-testid="stSidebar"] > div:first-child {{
   background: rgba(255,255,255,.04);
   border-right: 1px solid rgba(255,255,255,.08);
   backdrop-filter: blur(10px);
 }}
-/* Card look */
 .kpi-card {{
   border: 1px solid rgba(255,255,255,.10);
   background: {THEME["card_grad"]};
@@ -129,14 +127,9 @@ st.markdown(
 .kpi-value {{ color:#fff; font-size:1.8rem; font-weight:700; line-height:1.1; }}
 .badge {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border-radius:999px;
          border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#e5e7eb; font-size:.78rem;}}
-/* Tabs */
-.stTabs [data-baseweb="tab"] {{
-  background: rgba(255,255,255,.05);
-  border: 1px solid rgba(255,255,255,.10);
-  border-bottom:none; border-radius:10px 10px 0 0;
-}}
+.stTabs [data-baseweb="tab"] {{ background: rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.10);
+  border-bottom:none; border-radius:10px 10px 0 0; }}
 .stTabs [aria-selected="true"] {{ background: rgba(255,255,255,.10); }}
-/* Tables */
 .dataframe th, .dataframe td {{ border-color: rgba(255,255,255,.08)!important; }}
 </style>
 """,
@@ -240,6 +233,97 @@ def card(title: str, value_html: str, badge: str|None=None, color: str|None=None
         """,
         unsafe_allow_html=True,
     )
+
+# ---------- Excel-style STOCKS table builder ----------
+def build_stocks_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a DataFrame with the Excel-like columns:
+    Stock (Company • SYMBOL), Symbol, Buy/Sell, Shares, Each, Current (proxy),
+    Stop, Target1, Target2, Trade Price, Market Value, Profit/Loss, Change,
+    Change(%), Change Total.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Stock (Company • Ticker)","Symbol","Buy/Sell","Shares","Each","Current",
+            "Stop","Target 1","Target 2","Trade Price","Market Value","Profit/Loss",
+            "Change","Change(%)","Change Total"
+        ])
+
+    d = df.copy()
+    d["Each"] = (d["entry_total"]/d["shares"]).where(d["shares"]>0, 0.0)
+    # Current proxy: exit_price if closed, else Each
+    d["Current"] = d["exit_price"].where(d["realized"], d["Each"])
+    d["Trade Price"] = d["exit_price"].where(d["realized"], 0.0)
+
+    # Profit/Loss (realized pnl if closed; else mark-to-entry)
+    unreal = (d["Current"] - d["Each"]) * d["shares"]
+    d["Profit/Loss"] = d["pnl"].where(d["realized"], unreal)
+
+    d["Change"] = d["Current"] - d["Each"]
+    d["Change(%)"] = (d["Change"] / d["Each"] * 100).where(d["Each"]>0, 0.0)
+    d["Change Total"] = d["Change"] * d["shares"]
+    d["Market Value"] = d["shares"] * d["Current"]
+
+    # “Buy/Sell” from side (long=Buy, short=Sell)
+    d["Buy/Sell"] = d["side"].str.lower().map({"long":"Buy","short":"Sell"}).fillna("")
+
+    # Pretty stock label
+    d["Stock (Company • Ticker)"] = d.apply(lambda r: f"{(r['company'] or '').strip() or r['symbol']} • {r['symbol']}", axis=1)
+
+    out = d[
+        [
+            "Stock (Company • Ticker)","symbol","Buy/Sell","shares","Each","Current",
+            "stop_price","target1","target2","Trade Price","Market Value","Profit/Loss",
+            "Change","Change(%)","Change Total"
+        ]
+    ].rename(columns={
+        "symbol": "Symbol",
+        "stop_price":"Stop",
+        "target1":"Target 1",
+        "target2":"Target 2",
+    })
+
+    # order by Symbol then id desc-ish feel
+    out = out.sort_values(["Symbol"], ascending=True).reset_index(drop=True)
+    return out
+
+def style_stocks_table(df_stocks: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Return Styler with green/red coloring and money formatting."""
+    money_cols = ["Each","Current","Stop","Target 1","Target 2","Trade Price","Market Value","Profit/Loss","Change","Change Total"]
+    pct_cols = ["Change(%)"]
+    int_cols = ["Shares"]
+
+    styled = df_stocks.style
+
+    # number formats
+    for c in money_cols:
+        if c in df_stocks.columns:
+            styled = styled.format({c: (lambda x: mask_money(float(x)))})
+    for c in pct_cols:
+        if c in df_stocks.columns:
+            styled = styled.format({c: (lambda x: mask_pct(float(x)))})
+    if "Shares" in df_stocks.columns:
+        styled = styled.format({"Shares": lambda x: f"{float(x):,.4f}"})
+
+    # color helpers
+    def posneg(val):
+        try:
+            v = float(val)
+        except Exception:
+            return ""
+        if v > 0:
+            return f"color:{GOOD};"
+        if v < 0:
+            return f"color:{BAD};"
+        return f"color:#e5e7eb;"
+
+    for col in ["Profit/Loss","Change","Change(%)","Change Total"]:
+        if col in df_stocks.columns:
+            styled = styled.applymap(posneg, subset=pd.IndexSlice[:, [col]])
+
+    # header/row borders subtle
+    styled = styled.set_properties(**{"border-color":"rgba(255,255,255,.10)"})
+    return styled
 
 # -----------------------------
 # SIDEBAR NAV
@@ -405,8 +489,9 @@ if page == "Dashboard":
                 )
                 b2.altair_chart(chart2, use_container_width=True)
 
-        # Trades table
+        # Trades + Stocks table
         with tab4:
+            st.markdown("#### All Trades (filtered)")
             cols = [TID,"entry_date","symbol","side","shares","entry_total","exit_date","exit_price","fees_total","pnl","ret_pct","hold_days","strategy","notes"]
             cols = [c for c in cols if c in df_f.columns]
             t = df_f[cols].sort_values(TID, ascending=False).copy()
@@ -415,10 +500,18 @@ if page == "Dashboard":
             if "ret_pct" in t.columns: t["ret_pct"]=t["ret_pct"].map(lambda x: mask_pct(float(x)))
             if "shares" in t.columns: t["shares"]=t["shares"].map(lambda x: f"{float(x):,.4f}")
             if "hold_days" in t.columns: t["hold_days"]=t["hold_days"].map(lambda x: "" if pd.isna(x) else int(x))
-            st.dataframe(t, use_container_width=True, height=520)
+            st.dataframe(t, use_container_width=True, height=260)
+
+            st.markdown("### Stocks (Excel-style)")
+            stock_df = build_stocks_table(df_f)
+            if stock_df.empty:
+                st.info("No rows to show.")
+            else:
+                styled = style_stocks_table(stock_df)
+                st.dataframe(styled, use_container_width=True, height=420)
 
 # ============================================================
-# REPORTING SUMMARY (Excel-style)
+# REPORTING SUMMARY
 # ============================================================
 elif page == "Reporting Summary":
     st.markdown("## Reporting Summary")
@@ -429,7 +522,6 @@ elif page == "Reporting Summary":
     if df.empty:
         st.info("No trades yet.")
     else:
-        # Controls
         c1,c2 = st.columns([2,1])
         with c1:
             valid = df[~df["entry_dt"].isna()]
@@ -452,7 +544,7 @@ elif page == "Reporting Summary":
         avg_loss = float(realized.loc[realized["pnl"]<=0,"pnl"].mean()) if losers else 0.0
         total_invested = float(rep["entry_total"].sum())
         realized_net   = float(realized["pnl"].sum()) if not realized.empty else 0.0
-        # "Annualized" (very rough proxy): equity curve pct scaled to yearly; safer to show cumulative % over period
+
         eq = realized.sort_values("exit_dt")[["exit_dt","pnl"]].dropna()
         if not eq.empty:
             eq["cum"] = eq["pnl"].cumsum()
@@ -460,19 +552,16 @@ elif page == "Reporting Summary":
         else:
             eq = pd.DataFrame({"exit_dt":[], "cum":[], "pct":[]})
 
-        # KPI Bar
         k1,k2,k3,k4,k5,k6 = st.columns(6)
         with k1: card("Realized Net Gain/Loss", mask_money(realized_net), color=GOOD if realized_net>=0 else BAD, badge="realized")
-        with k2: card("Portfolio Net Gain/Loss", mask_money(realized_net), color=GOOD if realized_net>=0 else BAD)  # same proxy
+        with k2: card("Portfolio Net Gain/Loss", mask_money(realized_net), color=GOOD if realized_net>=0 else BAD)
         with k3: card("Winners", f"{winners}")
         with k4: card("Losers", f"{losers}")
         with k5: card("Average Win", mask_money(avg_win))
         with k6: card("Average Loss", mask_money(avg_loss))
 
-        # Charts row
         g1,g2 = st.columns([1.4,1], gap="large")
         with g1:
-            # Gains by Symbol
             if realized.empty:
                 st.info("No realized trades in range.")
             else:
@@ -506,7 +595,6 @@ elif page == "Reporting Summary":
                 )
                 st.altair_chart(line, use_container_width=True)
 
-        # Summary table
         st.markdown("#### Summaries")
         if realized.empty:
             st.info("No realized trades to summarize.")
@@ -527,7 +615,7 @@ elif page == "Reporting Summary":
             st.dataframe(summ, use_container_width=True, height=360)
 
 # ============================================================
-# ADD / MANAGE TRADES  (Editor + Delete)
+# ADD / MANAGE TRADES
 # ============================================================
 else:
     st.markdown("## Add Trade")
